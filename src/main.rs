@@ -1,5 +1,9 @@
-use actix_web::{App, HttpResponse, HttpServer, Result, middleware::Logger, web};
+use actix_web::{
+    App, Error, HttpResponse, HttpServer, Result, dev::ServiceRequest, dev::ServiceResponse,
+    dev::Transform, middleware::Logger, web,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use futures_util::future::LocalBoxFuture;
 use serde::{Deserialize, Serialize};
 use solana_sdk::{
     pubkey::Pubkey,
@@ -11,29 +15,98 @@ use std::str::FromStr;
 
 // Standard response structures
 #[derive(Serialize)]
-struct ApiResponse<T> {
-    success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+#[serde(untagged)]
+enum ApiResponse<T> {
+    Success { success: bool, data: T },
+    Error { success: bool, error: String },
 }
 
 impl<T> ApiResponse<T> {
     fn success(data: T) -> Self {
-        Self {
+        Self::Success {
             success: true,
-            data: Some(data),
-            error: None,
+            data,
         }
     }
 
     fn error(error: String) -> Self {
-        Self {
+        Self::Error {
             success: false,
-            data: None,
-            error: Some(error),
+            error,
         }
+    }
+}
+
+// Request logging middleware
+struct RequestLogger;
+
+impl<S, B> Transform<S, ServiceRequest> for RequestLogger
+where
+    S: actix_web::dev::Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S::Future: 'static,
+    B: 'static,
+{
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type InitError = ();
+    type Transform = RequestLoggerMiddleware<S>;
+    type Future = std::future::Ready<Result<Self::Transform, Self::InitError>>;
+
+    fn new_transform(&self, service: S) -> Self::Future {
+        std::future::ready(Ok(RequestLoggerMiddleware { service }))
+    }
+}
+
+struct RequestLoggerMiddleware<S> {
+    service: S,
+}
+
+impl<S, B> actix_web::dev::Service<ServiceRequest> for RequestLoggerMiddleware<S>
+where
+    S: actix_web::dev::Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S::Future: 'static,
+    B: 'static,
+{
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    actix_web::dev::forward_ready!(service);
+
+    fn call(&self, req: ServiceRequest) -> Self::Future {
+        println!("📥 Incoming Request: {} {}", req.method(), req.path());
+        println!("📥 Headers: {:?}", req.headers());
+
+        // Extract and log request body for POST requests
+        let method = req.method().clone();
+        let path = req.path().to_string();
+
+        if method == "POST" {
+            let content_type = req
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+
+            if content_type.contains("application/json") {
+                println!("📥 Content-Type: {}", content_type);
+                if let Some(content_length) = req.headers().get("content-length") {
+                    println!("📥 Content-Length: {:?}", content_length);
+                }
+            }
+        }
+
+        let fut = self.service.call(req);
+        Box::pin(async move {
+            let res = fut.await?;
+            println!(
+                "📤 Response Status: {} for {} {}",
+                res.status(),
+                method,
+                path
+            );
+            Ok(res)
+        })
     }
 }
 
@@ -44,7 +117,7 @@ struct KeypairResponse {
     secret: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct CreateTokenRequest {
     #[serde(rename = "mintAuthority")]
     mint_authority: String,
@@ -52,7 +125,7 @@ struct CreateTokenRequest {
     decimals: u8,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct MintTokenRequest {
     mint: String,
     destination: String,
@@ -60,7 +133,7 @@ struct MintTokenRequest {
     amount: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct SignMessageRequest {
     message: String,
     secret: String,
@@ -73,7 +146,7 @@ struct SignMessageResponse {
     message: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct VerifyMessageRequest {
     message: String,
     signature: String,
@@ -87,14 +160,14 @@ struct VerifyMessageResponse {
     pubkey: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct SendSolRequest {
     from: String,
     to: String,
     lamports: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct SendTokenRequest {
     destination: String,
     mint: String,
@@ -107,6 +180,27 @@ struct InstructionResponse {
     program_id: String,
     accounts: Vec<AccountInfo>,
     instruction_data: String,
+}
+
+#[derive(Serialize)]
+struct SolTransferResponse {
+    program_id: String,
+    accounts: Vec<String>,
+    instruction_data: String,
+}
+
+#[derive(Serialize)]
+struct TokenTransferResponse {
+    program_id: String,
+    accounts: Vec<TokenAccountInfo>,
+    instruction_data: String,
+}
+
+#[derive(Serialize)]
+struct TokenAccountInfo {
+    pubkey: String,
+    #[serde(rename = "isSigner")]
+    is_signer: bool,
 }
 
 #[derive(Serialize)]
@@ -144,6 +238,7 @@ async fn generate_keypair() -> Result<HttpResponse> {
 }
 
 async fn create_token(req: web::Json<CreateTokenRequest>) -> Result<HttpResponse> {
+    println!("📥 POST /token/create body: {:?}", req);
     match (parse_pubkey(&req.mint_authority), parse_pubkey(&req.mint)) {
         (Ok(mint_authority), Ok(mint)) => {
             let instruction = initialize_mint(
@@ -177,13 +272,14 @@ async fn create_token(req: web::Json<CreateTokenRequest>) -> Result<HttpResponse
                     Ok(HttpResponse::Ok().json(response))
                 }
                 Err(e) => {
-                    let response = ApiResponse::<()>::error(e);
+                    let response = ApiResponse::<InstructionResponse>::error(e);
                     Ok(HttpResponse::BadRequest().json(response))
                 }
             }
         }
         _ => {
-            let response = ApiResponse::<()>::error("Invalid public key format".to_string());
+            let response =
+                ApiResponse::<InstructionResponse>::error("Invalid public key format".to_string());
             Ok(HttpResponse::BadRequest().json(response))
         }
     }
@@ -228,21 +324,24 @@ async fn mint_token(req: web::Json<MintTokenRequest>) -> Result<HttpResponse> {
                     Ok(HttpResponse::Ok().json(response))
                 }
                 Err(e) => {
-                    let response = ApiResponse::<()>::error(e);
+                    let response = ApiResponse::<InstructionResponse>::error(e);
                     Ok(HttpResponse::BadRequest().json(response))
                 }
             }
         }
         _ => {
-            let response = ApiResponse::<()>::error("Invalid public key format".to_string());
+            let response =
+                ApiResponse::<InstructionResponse>::error("Invalid public key format".to_string());
             Ok(HttpResponse::BadRequest().json(response))
         }
     }
 }
 
 async fn sign_message(req: web::Json<SignMessageRequest>) -> Result<HttpResponse> {
+    println!("📥 POST /message/sign body: {:?}", req);
     if req.message.is_empty() || req.secret.is_empty() {
-        let response = ApiResponse::<()>::error("Missing required fields".to_string());
+        let response =
+            ApiResponse::<SignMessageResponse>::error("Missing required fields".to_string());
         return Ok(HttpResponse::BadRequest().json(response));
     }
 
@@ -261,7 +360,7 @@ async fn sign_message(req: web::Json<SignMessageRequest>) -> Result<HttpResponse
             Ok(HttpResponse::Ok().json(response))
         }
         Err(e) => {
-            let response = ApiResponse::<()>::error(e);
+            let response = ApiResponse::<SignMessageResponse>::error(e);
             Ok(HttpResponse::BadRequest().json(response))
         }
     }
@@ -273,7 +372,9 @@ async fn verify_message(req: web::Json<VerifyMessageRequest>) -> Result<HttpResp
             let signature_bytes = match BASE64.decode(&req.signature) {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    let response = ApiResponse::<()>::error("Invalid base64 signature".to_string());
+                    let response = ApiResponse::<VerifyMessageResponse>::error(
+                        "Invalid base64 signature".to_string(),
+                    );
                     return Ok(HttpResponse::BadRequest().json(response));
                 }
             };
@@ -281,7 +382,9 @@ async fn verify_message(req: web::Json<VerifyMessageRequest>) -> Result<HttpResp
             let signature = match Signature::try_from(signature_bytes.as_slice()) {
                 Ok(sig) => sig,
                 Err(_) => {
-                    let response = ApiResponse::<()>::error("Invalid signature format".to_string());
+                    let response = ApiResponse::<VerifyMessageResponse>::error(
+                        "Invalid signature format".to_string(),
+                    );
                     return Ok(HttpResponse::BadRequest().json(response));
                 }
             };
@@ -299,16 +402,18 @@ async fn verify_message(req: web::Json<VerifyMessageRequest>) -> Result<HttpResp
             Ok(HttpResponse::Ok().json(response))
         }
         Err(e) => {
-            let response = ApiResponse::<()>::error(e);
+            let response = ApiResponse::<VerifyMessageResponse>::error(e);
             Ok(HttpResponse::BadRequest().json(response))
         }
     }
 }
 
 async fn send_sol(req: web::Json<SendSolRequest>) -> Result<HttpResponse> {
+    // Validate amount - zero transfers are not valid
     if req.lamports == 0 {
-        let response =
-            ApiResponse::<()>::error("Invalid amount: must be greater than 0".to_string());
+        let response = ApiResponse::<SolTransferResponse>::error(
+            "Invalid amount: must be greater than 0".to_string(),
+        );
         return Ok(HttpResponse::BadRequest().json(response));
     }
 
@@ -316,17 +421,14 @@ async fn send_sol(req: web::Json<SendSolRequest>) -> Result<HttpResponse> {
         (Ok(from), Ok(to)) => {
             let instruction = system_instruction::transfer(&from, &to, req.lamports);
 
-            let accounts: Vec<AccountInfo> = instruction
+            // Per requirements: accounts should be array of address strings
+            let accounts: Vec<String> = instruction
                 .accounts
                 .iter()
-                .map(|acc| AccountInfo {
-                    pubkey: acc.pubkey.to_string(),
-                    is_signer: acc.is_signer,
-                    is_writable: acc.is_writable,
-                })
+                .map(|acc| acc.pubkey.to_string())
                 .collect();
 
-            let response_data = InstructionResponse {
+            let response_data = SolTransferResponse {
                 program_id: instruction.program_id.to_string(),
                 accounts,
                 instruction_data: BASE64.encode(&instruction.data),
@@ -336,16 +438,20 @@ async fn send_sol(req: web::Json<SendSolRequest>) -> Result<HttpResponse> {
             Ok(HttpResponse::Ok().json(response))
         }
         _ => {
-            let response = ApiResponse::<()>::error("Invalid public key format".to_string());
+            let response =
+                ApiResponse::<SolTransferResponse>::error("Invalid public key format".to_string());
             Ok(HttpResponse::BadRequest().json(response))
         }
     }
 }
 
 async fn send_token(req: web::Json<SendTokenRequest>) -> Result<HttpResponse> {
+    println!("📥 POST /send/token body: {:?}", req);
+    // Validate amount - zero transfers are not valid
     if req.amount == 0 {
-        let response =
-            ApiResponse::<()>::error("Invalid amount: must be greater than 0".to_string());
+        let response = ApiResponse::<TokenTransferResponse>::error(
+            "Invalid amount: must be greater than 0".to_string(),
+        );
         return Ok(HttpResponse::BadRequest().json(response));
     }
 
@@ -371,17 +477,17 @@ async fn send_token(req: web::Json<SendTokenRequest>) -> Result<HttpResponse> {
 
             match instruction {
                 Ok(ix) => {
-                    let accounts: Vec<AccountInfo> = ix
+                    // Per requirements: use isSigner field name
+                    let accounts: Vec<TokenAccountInfo> = ix
                         .accounts
                         .iter()
-                        .map(|acc| AccountInfo {
+                        .map(|acc| TokenAccountInfo {
                             pubkey: acc.pubkey.to_string(),
                             is_signer: acc.is_signer,
-                            is_writable: acc.is_writable,
                         })
                         .collect();
 
-                    let response_data = InstructionResponse {
+                    let response_data = TokenTransferResponse {
                         program_id: ix.program_id.to_string(),
                         accounts,
                         instruction_data: BASE64.encode(&ix.data),
@@ -391,13 +497,15 @@ async fn send_token(req: web::Json<SendTokenRequest>) -> Result<HttpResponse> {
                     Ok(HttpResponse::Ok().json(response))
                 }
                 Err(e) => {
-                    let response = ApiResponse::<()>::error(e);
+                    let response = ApiResponse::<TokenTransferResponse>::error(e);
                     Ok(HttpResponse::BadRequest().json(response))
                 }
             }
         }
         _ => {
-            let response = ApiResponse::<()>::error("Invalid public key format".to_string());
+            let response = ApiResponse::<TokenTransferResponse>::error(
+                "Invalid public key format".to_string(),
+            );
             Ok(HttpResponse::BadRequest().json(response))
         }
     }
@@ -412,6 +520,16 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
         App::new()
             .wrap(Logger::default())
+            .wrap(RequestLogger)
+            .app_data(web::JsonConfig::default().error_handler(|err, _req| {
+                actix_web::error::InternalError::from_response(
+                    err,
+                    HttpResponse::BadRequest().json(ApiResponse::<()>::error(
+                        "Invalid JSON format or missing required fields".to_string(),
+                    )),
+                )
+                .into()
+            }))
             .route("/keypair", web::post().to(generate_keypair))
             .route("/token/create", web::post().to(create_token))
             .route("/token/mint", web::post().to(mint_token))
